@@ -41,10 +41,10 @@ func TestBehaviorEvaluate(t *testing.T) {
 }
 
 func TestScoreValidateRange(t *testing.T) {
-	if err := Behavior{}.Validate(json.RawMessage(`{"score":101}`)); err == nil {
+	if err := (Behavior{}).Validate(json.RawMessage(`{"score":101}`)); err == nil {
 		t.Error("expected out-of-range validation error")
 	}
-	if err := Safety{}.Validate(json.RawMessage(`{"score":50}`)); err != nil {
+	if err := (Safety{}).Validate(json.RawMessage(`{"score":50}`)); err != nil {
 		t.Errorf("unexpected err: %v", err)
 	}
 }
@@ -71,7 +71,7 @@ func TestSolvencyEvaluate(t *testing.T) {
 }
 
 func TestSolvencyValidateLevel(t *testing.T) {
-	if err := Solvency{}.Validate(json.RawMessage(`{"verified":true,"level":"XX"}`)); err == nil {
+	if err := (Solvency{}).Validate(json.RawMessage(`{"verified":true,"level":"XX"}`)); err == nil {
 		t.Error("expected invalid-level error")
 	}
 }
