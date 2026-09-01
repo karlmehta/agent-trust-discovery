@@ -1,6 +1,7 @@
 package scorecontainer
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -40,25 +41,25 @@ func TestEvaluate(t *testing.T) {
 	s := New("trustmodel.safety.score", domain.DimensionSafety, DefaultLowThreshold)
 
 	// nil obs -> 0 + vendor-scoped UNKNOWN
-	r, _ := s.Evaluate(nil, domain.Agent{}, nil)
+	r, _ := s.Evaluate(context.TODO(), domain.Agent{}, nil)
 	if r.Raw != 0 || !contains(r.RiskCodes, "SAFETY_TRUSTMODEL_UNKNOWN") {
 		t.Errorf("nil: raw=%d codes=%v", r.Raw, r.RiskCodes)
 	}
 
 	// clean high score -> no codes
-	r, _ = s.Evaluate(nil, domain.Agent{}, obs(`{"score":86}`))
+	r, _ = s.Evaluate(context.TODO(), domain.Agent{}, obs(`{"score":86}`))
 	if r.Raw != 86 || len(r.RiskCodes) != 0 {
 		t.Errorf("high: raw=%d codes=%v", r.Raw, r.RiskCodes)
 	}
 
 	// below threshold -> vendor-scoped backstop
-	r, _ = s.Evaluate(nil, domain.Agent{}, obs(`{"score":40}`))
+	r, _ = s.Evaluate(context.TODO(), domain.Agent{}, obs(`{"score":40}`))
 	if !contains(r.RiskCodes, "SAFETY_TRUSTMODEL_SCORE_LOW") {
 		t.Errorf("low: codes=%v", r.RiskCodes)
 	}
 
 	// provider codes pass through with prefix filter; explanation surfaced
-	r, _ = s.Evaluate(nil, domain.Agent{},
+	r, _ = s.Evaluate(context.TODO(), domain.Agent{},
 		obs(`{"score":30,"riskCodes":["SAFETY_PROMPT_INJECTION","BEHAVIOR_STALE"],"explanation":"2/40 jailbroke"}`))
 	if !contains(r.RiskCodes, "SAFETY_PROMPT_INJECTION") {
 		t.Errorf("provider code dropped: %v", r.RiskCodes)
@@ -77,8 +78,8 @@ func TestVendorScopedCodes(t *testing.T) {
 	tm := New("trustmodel.safety.score", domain.DimensionSafety, 70)
 	ag := New("agentgraph.safety.score", domain.DimensionSafety, 70)
 
-	rt, _ := tm.Evaluate(nil, domain.Agent{}, obs(`{"score":10}`))
-	ra, _ := ag.Evaluate(nil, domain.Agent{}, obs(`{"score":10}`))
+	rt, _ := tm.Evaluate(context.TODO(), domain.Agent{}, obs(`{"score":10}`))
+	ra, _ := ag.Evaluate(context.TODO(), domain.Agent{}, obs(`{"score":10}`))
 	if !contains(rt.RiskCodes, "SAFETY_TRUSTMODEL_SCORE_LOW") {
 		t.Errorf("trustmodel backstop missing: %v", rt.RiskCodes)
 	}
@@ -110,7 +111,7 @@ func TestValidate(t *testing.T) {
 
 func TestThresholdConfigurable(t *testing.T) {
 	strict := New("trustmodel.safety.score", domain.DimensionSafety, 90)
-	r, _ := strict.Evaluate(nil, domain.Agent{}, obs(`{"score":85}`))
+	r, _ := strict.Evaluate(context.TODO(), domain.Agent{}, obs(`{"score":85}`))
 	if !contains(r.RiskCodes, "SAFETY_TRUSTMODEL_SCORE_LOW") {
 		t.Errorf("threshold 90: score 85 should trip backstop, got %v", r.RiskCodes)
 	}
