@@ -165,40 +165,53 @@ are set, `uptime` displays its score for transparency without affecting
 classification. This lets you roll a new dimension out observably before it
 gates trust decisions.
 
-## Is a missing observation informative? (`AbsenceAware`)
+## Config-driven registration (a provider score signal, no Go code)
 
-By default, a signal with a profile weight but no observation for an agent
-scores `0` at full weight and counts toward its dimension. For the integrity
-built-ins that is correct — they are computable from public DNS and certificates
-at zero marginal cost, so a *missing* observation (no DNSSEC record) is itself
-meaningful.
+Steps 1–2 above compile a custom signal into the binary. A provider that just
+needs a **0–100 dimension score** does not have to: it registers a generic
+`scorecontainer` signal from config and hydrates it over the import API, with no
+Go code at all.
 
-For a **provider-fed** signal it usually is not. Absence in `solvency`,
-`behavior`, or `safety` means "no provider has covered this agent yet", which
-says nothing about the agent — and scoring it `0` penalizes the agent for a
-coverage gap, so adding any provider becomes a global downgrade for every agent
-it has not seen (issue #13).
+Point the runtime config at a score-signals file (a relative path resolves
+against the config file's directory, like the profile paths):
 
-Opt out by implementing the optional interface:
-
-```go
-// AbsenceInformative reports false when a missing observation carries no
-// information about the agent. The engine then EXCLUDES this signal from the
-// dimension roll-up for agents it has no observation for, instead of scoring 0.
-func (s MySignal) AbsenceInformative() bool { return false }
+```yaml
+# config.yaml
+signals:
+  path: config/score-signals.yaml
 ```
 
-Signals that do not implement it, or return `true`, keep the default
-absence-scores-zero behavior. A dimension whose every signal is absent-excluded
-carries no signal scores and stays inactive (unknown) rather than a misleading
-active-`0`. This decides whether your signal is a *term* in the average or is
-simply *not present* when you have no data on an agent; it does not change how a
-present observation scores.
+```yaml
+# config/score-signals.yaml — one entry per provider dimension score.
+# Use your own vendor segment; "acme" here is a placeholder.
+signals:
+  - id: acme.safety.score            # vendor.dimension.name; segment must match dimension
+    dimension: safety
+    threshold: 70                     # score below this adds SAFETY_ACME_SCORE_LOW;
+                                      # omit for the default (70), or 0 for no backstop
+  - id: agentgraph.safety.score      # a second provider, beside the first, no core change
+    dimension: safety
+    subject: tool                     # this score is about the tool/MCP server, not the agent
+```
+
+`subject` defaults to `agent`. Declare it (an open lowercase token — `agent`,
+`tool`, `org`, …) when a score is about a different entity than the agent, so a
+Trust Index can bucket by subject and never average, e.g., a tool's safety into
+an agent's safety within one dimension.
+
+At boot the engine materializes a `scorecontainer` signal per entry (§the
+neutral container: `internal/scoring/signals/scorecontainer`), so each gets the
+same validation, dimension-scoped risk-code passthrough, low-score backstop, and
+absence semantics as a code-registered signal. Give it a weight (step 3), and
+the provider's hydrator POSTs `{score, riskCodes, explanation}` observations to
+`/v1/internal/observations/import` for that id, with any evidence on the
+observation's `provenance` envelope. Leaving `signals.path` unset registers no
+provider signals (opt-in); a path that is set but points at a missing file is a
+boot error, not a silent no-op, so a misresolved path fails loudly.
 
 ## What you do not do
 
 - No code generation, no `plugin` loading.
 - No separate value-schema registry — `Validate` is the schema.
-- No engine changes to add a signal — the engine discovers signals through the
-  registry. (The absence semantics above are an existing engine capability a
-  signal opts into, not a per-signal engine change.)
+- No engine changes to add a signal — code-registered signals go through the
+  registry, and provider score signals come from config (both discovered at boot).
