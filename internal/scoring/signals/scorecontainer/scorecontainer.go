@@ -24,6 +24,7 @@
 package scorecontainer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,17 @@ import (
 
 	"github.com/agentnameservice/agent-trust-discovery/internal/domain"
 	"github.com/agentnameservice/agent-trust-discovery/internal/port"
+)
+
+// ScoreSignal implements both port.Signal and port.AbsenceAware. The compile
+// guard keeps the pairing honest: the container's absence semantics (absent !=
+// scored-0) only take effect once the engine honours port.AbsenceAware, so this
+// package must be built against a tree that defines it. If AbsenceAware is not
+// present, this line fails to compile rather than silently reverting a covered
+// dimension to a 0 roll-up.
+var (
+	_ port.Signal       = ScoreSignal{}
+	_ port.AbsenceAware = ScoreSignal{}
 )
 
 // DefaultLowThreshold is the score below which the generic
@@ -51,10 +63,33 @@ var riskCodeRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
 // providers emit JSON of this shape from their hydrator; they do not construct
 // the Go struct. A bare {"score": N} is valid — you then get only the backstop,
 // so a minimal hydrator still works.
+//
+// Score is a *int, not an int, so the three ways a hydrator can fail to send a
+// score are all distinguishable from a real 0 (the worst score on the scale):
+// an absent field ({}), an explicit null ({"score":null}), and — paired with
+// DisallowUnknownFields in decodeScore — a misspelled field ({"scores":50}).
+// All three become a 422 at import instead of silently punishing the agent.
 type scoreValue struct {
-	Score       int      `json:"score"`                 // 0..100
+	Score       *int     `json:"score"`                 // 0..100, required
 	RiskCodes   []string `json:"riskCodes,omitempty"`   // provider-asserted, {DIMENSION}_-prefixed
 	Explanation string   `json:"explanation,omitempty"` // optional; surfaced in the API response
+}
+
+// decodeScore is the single strict decode used by both Validate and Evaluate.
+// DisallowUnknownFields turns a field-name typo into an error rather than a
+// silently-dropped value, and the explicit nil check turns an absent/null score
+// into an error rather than a real 0.
+func decodeScore(raw json.RawMessage) (scoreValue, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var v scoreValue
+	if err := dec.Decode(&v); err != nil {
+		return scoreValue{}, err
+	}
+	if v.Score == nil {
+		return scoreValue{}, fmt.Errorf("score is required")
+	}
+	return v, nil
 }
 
 // ScoreSignal is a generic provider-score signal for one dimension. Construct
@@ -68,13 +103,24 @@ type ScoreSignal struct {
 
 // New builds a ScoreSignal for a vendor.dimension.name id. The id's vendor
 // segment prefixes the generic backstop code (e.g. "trustmodel" ->
-// SAFETY_TRUSTMODEL_SCORE_LOW). threshold <= 0 falls back to DefaultLowThreshold.
-func New(id domain.SignalID, dim domain.Dimension, threshold int) ScoreSignal {
-	if threshold <= 0 {
-		threshold = DefaultLowThreshold
+// SAFETY_TRUSTMODEL_SCORE_LOW).
+//
+// threshold is a *int so 0 is a usable value: nil applies DefaultLowThreshold,
+// while an explicit 0 means "no low-score backstop" (a score can never be below
+// 0, so the {DIMENSION}_<VENDOR>_SCORE_LOW code is never emitted). Previously a
+// <= 0 threshold silently became 70, so an operator asking for "no backstop"
+// got the opposite.
+func New(id domain.SignalID, dim domain.Dimension, threshold *int) ScoreSignal {
+	t := DefaultLowThreshold
+	if threshold != nil {
+		t = *threshold
 	}
-	vendor := strings.ToUpper(vendorSegment(string(id)))
-	return ScoreSignal{id: id, dimension: dim, vendor: vendor, threshold: threshold}
+	// Normalise the vendor segment to the risk-code charset (^[A-Z0-9_]+$) so a
+	// hyphenated vendor like "acme-labs" yields SAFETY_ACME_LABS_SCORE_LOW, a
+	// valid code, rather than SAFETY_ACME-LABS_SCORE_LOW, which would fail the
+	// very shape check we enforce on provider-supplied codes.
+	vendor := sanitizeSegment(vendorSegment(string(id)))
+	return ScoreSignal{id: id, dimension: dim, vendor: vendor, threshold: t}
 }
 
 // vendorSegment returns the first dot-segment of a vendor.dimension.name id,
@@ -84,6 +130,23 @@ func vendorSegment(id string) string {
 		return id[:i]
 	}
 	return id
+}
+
+// sanitizeSegment uppercases a segment and maps any character outside
+// [A-Z0-9_] to '_', so the generated backstop code always matches riskCodeRe.
+func sanitizeSegment(s string) string {
+	up := strings.ToUpper(s)
+	var b strings.Builder
+	b.Grow(len(up))
+	for _, r := range up {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 func (s ScoreSignal) ID() domain.SignalID         { return s.id }
@@ -104,21 +167,30 @@ func (s ScoreSignal) prefix() string {
 }
 
 // Validate enforces the container schema before the observation is persisted:
-// score in range, each risk code well-formed, and the count capped.
+// a required score in range, each risk code well-formed AND prefixed for this
+// signal's dimension, and the count capped. Rejecting a wrong-dimension code
+// here (rather than dropping it in Evaluate) means a hydrator that emits
+// "SAFTEY_..." for a safety signal — a typo, or a code meant for another
+// dimension — gets a 422 telling it why, instead of the code silently vanishing
+// from the score with no feedback.
 func (s ScoreSignal) Validate(value json.RawMessage) error {
-	var v scoreValue
-	if err := json.Unmarshal(value, &v); err != nil {
+	v, err := decodeScore(value)
+	if err != nil {
 		return fmt.Errorf("%s: invalid value: %w", s.id, err)
 	}
-	if v.Score < 0 || v.Score > 100 {
-		return fmt.Errorf("%s: score must be in [0,100], got %d", s.id, v.Score)
+	if *v.Score < 0 || *v.Score > 100 {
+		return fmt.Errorf("%s: score must be in [0,100], got %d", s.id, *v.Score)
 	}
 	if len(v.RiskCodes) > maxRiskCodes {
 		return fmt.Errorf("%s: too many riskCodes (%d > %d)", s.id, len(v.RiskCodes), maxRiskCodes)
 	}
+	prefix := s.prefix()
 	for _, c := range v.RiskCodes {
 		if !riskCodeRe.MatchString(c) {
 			return fmt.Errorf("%s: risk code %q must match %s", s.id, c, riskCodeRe.String())
+		}
+		if !strings.HasPrefix(c, prefix) {
+			return fmt.Errorf("%s: risk code %q must be prefixed %q (the signal's dimension)", s.id, c, prefix)
 		}
 	}
 	return nil
@@ -139,27 +211,29 @@ func (s ScoreSignal) Evaluate(_ context.Context, _ domain.Agent, obs *domain.Sig
 			RiskCodes:   []string{prefix + s.vendor + "_UNKNOWN"},
 		}, nil
 	}
-	var v scoreValue
-	if err := json.Unmarshal(obs.Value, &v); err != nil {
+	v, err := decodeScore(obs.Value)
+	if err != nil {
 		return port.SignalResult{}, fmt.Errorf("%s: %w", s.id, err)
 	}
 
+	// Validate already rejects wrong-dimension codes at import, so this filter is
+	// a defence-in-depth pass for observations stored before that check existed.
 	codes := make([]string, 0, len(v.RiskCodes)+1)
 	for _, c := range v.RiskCodes {
 		if strings.HasPrefix(c, prefix) {
 			codes = append(codes, c)
 		}
 	}
-	if v.Score < s.threshold {
+	if *v.Score < s.threshold {
 		codes = append(codes, prefix+s.vendor+"_SCORE_LOW")
 	}
 
 	explanation := v.Explanation
 	if explanation == "" {
-		explanation = fmt.Sprintf("%s score %d/100", s.id, v.Score)
+		explanation = fmt.Sprintf("%s score %d/100", s.id, *v.Score)
 	}
 	return port.SignalResult{
-		Raw:         v.Score,
+		Raw:         *v.Score,
 		Explanation: explanation,
 		Attestation: domain.AttestationUnattested,
 		RiskCodes:   codes,
