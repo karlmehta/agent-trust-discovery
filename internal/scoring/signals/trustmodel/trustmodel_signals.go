@@ -90,6 +90,12 @@ func (s ScoreSignal) ID() domain.SignalID         { return s.id }
 func (s ScoreSignal) Dimension() domain.Dimension { return s.dimension }
 func (s ScoreSignal) Derived() bool               { return false }
 
+// AbsenceInformative reports false: a missing TrustModel observation means the
+// agent has not been scored by TrustModel yet, not that it scored badly. The
+// engine excludes this signal from the dimension roll-up when it has no
+// observation for an agent (issue #13) rather than dragging the score to 0.
+func (s ScoreSignal) AbsenceInformative() bool { return false }
+
 // prefix is the required {DIMENSION}_ prefix for this signal's risk codes, e.g.
 // "SOLVENCY_". Provider codes that don't carry it are dropped in Evaluate so a
 // signal can't leak a code into a dimension it doesn't own.
