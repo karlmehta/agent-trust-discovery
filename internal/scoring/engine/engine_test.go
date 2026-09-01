@@ -332,3 +332,107 @@ func TestNewDefaultsClock(t *testing.T) {
 		t.Error("EvaluationTime is zero; nil clock should default to time.Now")
 	}
 }
+
+// absenceSpy is a test signal for the issue #13(a) absent-observation policy.
+// It implements the optional port.AbsenceAware interface so a test can toggle
+// whether a missing observation is informative.
+type absenceSpy struct {
+	id          domain.SignalID
+	dim         domain.Dimension
+	raw         int
+	informative bool
+}
+
+func (s absenceSpy) ID() domain.SignalID            { return s.id }
+func (s absenceSpy) Dimension() domain.Dimension    { return s.dim }
+func (s absenceSpy) Derived() bool                  { return false }
+func (s absenceSpy) Validate(json.RawMessage) error { return nil }
+func (s absenceSpy) AbsenceInformative() bool       { return s.informative }
+func (s absenceSpy) Evaluate(_ context.Context, _ domain.Agent, _ *domain.SignalObservation) (port.SignalResult, error) {
+	return port.SignalResult{Raw: s.raw, Attestation: domain.AttestationUnattested}, nil
+}
+
+func registerAll(t *testing.T, sigs ...port.Signal) *registry.Registry {
+	t.Helper()
+	r := registry.New()
+	for _, s := range sigs {
+		if err := r.Register(s); err != nil {
+			t.Fatalf("register %s: %v", s.ID(), err)
+		}
+	}
+	return r
+}
+
+// The #13 scenario: two providers in one dimension, one has scored the agent
+// and one never has. The absent provider (absence non-informative) must be
+// EXCLUDED, so the dimension reads the covering provider's score, not the
+// average with a zero.
+func TestAbsentNonInformativeSignalExcluded(t *testing.T) {
+	covered := absenceSpy{id: "prov.a", dim: domain.DimensionSolvency, raw: 100, informative: false}
+	uncovered := absenceSpy{id: "prov.b", dim: domain.DimensionSolvency, raw: 0, informative: false}
+	r := registerAll(t, covered, uncovered)
+	store := fakeStore{obs: map[domain.SignalID]*domain.SignalObservation{"prov.a": obs(`{}`)}}
+	eng := engine.New(store, r, engine.DefaultThresholds(), time.Now)
+	prof := domain.ScoringProfile{
+		Name:             "solv",
+		DimensionWeights: map[domain.Dimension]float64{domain.DimensionSolvency: 1},
+		SignalWeights:    map[domain.SignalID]float64{"prov.a": 1, "prov.b": 1},
+	}
+	ev, err := eng.Evaluate(context.Background(), domain.Agent{ID: "a"}, prof)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	dim := findDim(t, ev, domain.DimensionSolvency)
+	if dim.Score != 100 {
+		t.Errorf("solvency = %d, want 100 (absent provider excluded, not averaged to 50)", dim.Score)
+	}
+	for _, s := range dim.SignalScores {
+		if s.SignalID == "prov.b" {
+			t.Errorf("absent non-informative prov.b must be excluded, got entry %+v", s)
+		}
+	}
+}
+
+// When every signal in a dimension is absent + non-informative, the dimension
+// carries no signal scores (inactive/unknown), not a misleading active-0.
+func TestAllAbsentDimensionCarriesNoScores(t *testing.T) {
+	only := absenceSpy{id: "prov.a", dim: domain.DimensionSafety, raw: 0, informative: false}
+	eng := engine.New(fakeStore{}, registerAll(t, only), engine.DefaultThresholds(), time.Now)
+	prof := domain.ScoringProfile{
+		Name:             "safety",
+		DimensionWeights: map[domain.Dimension]float64{domain.DimensionSafety: 1},
+		SignalWeights:    map[domain.SignalID]float64{"prov.a": 1},
+	}
+	ev, err := eng.Evaluate(context.Background(), domain.Agent{ID: "a"}, prof)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	dim := findDim(t, ev, domain.DimensionSafety)
+	if len(dim.SignalScores) != 0 {
+		t.Errorf("fully-uncovered dimension should carry no signal scores, got %+v", dim.SignalScores)
+	}
+}
+
+// A signal that does NOT opt out (absence informative) keeps the v1 behavior:
+// a missing observation scores 0 and counts. This preserves the integrity
+// built-ins, where a missing observation is itself meaningful.
+func TestAbsentInformativeSignalStillCountsZero(t *testing.T) {
+	informativeAbsent := absenceSpy{id: "prov.c", dim: domain.DimensionIntegrity, raw: 0, informative: true}
+	covered := absenceSpy{id: "prov.d", dim: domain.DimensionIntegrity, raw: 80, informative: true}
+	r := registerAll(t, informativeAbsent, covered)
+	store := fakeStore{obs: map[domain.SignalID]*domain.SignalObservation{"prov.d": obs(`{}`)}}
+	eng := engine.New(store, r, engine.DefaultThresholds(), time.Now)
+	prof := domain.ScoringProfile{
+		Name:             "intg",
+		DimensionWeights: map[domain.Dimension]float64{domain.DimensionIntegrity: 1},
+		SignalWeights:    map[domain.SignalID]float64{"prov.c": 1, "prov.d": 1},
+	}
+	ev, err := eng.Evaluate(context.Background(), domain.Agent{ID: "a"}, prof)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	dim := findDim(t, ev, domain.DimensionIntegrity)
+	if dim.Score != 40 { // (0 + 80) / 2 — informative absence still counts
+		t.Errorf("integrity = %d, want 40 (informative absence scores 0 and counts)", dim.Score)
+	}
+}

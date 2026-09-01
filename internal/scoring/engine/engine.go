@@ -57,6 +57,20 @@ func (e *Engine) Evaluate(ctx context.Context, agent domain.Agent, profile domai
 		if err != nil {
 			return domain.TrustEvaluation{}, fmt.Errorf("engine: latest observation %s/%s: %w", agent.ID, sig.ID(), err)
 		}
+		// Absent-observation policy (issue #13(a)): a signal that declares
+		// absence non-informative is EXCLUDED from the roll-up when it has no
+		// observation for this agent, rather than contributing a zero. Absence
+		// in a sparse, provider-fed dimension only means no provider has covered
+		// the agent yet — scoring it 0 penalizes the agent for a coverage gap
+		// and makes adding a provider a global downgrade. Signals that don't opt
+		// in (the integrity built-ins) keep the v1 absence-scores-zero behavior.
+		// No SignalScore and no risk code are recorded for a skipped signal, so
+		// a dimension covered by no one stays inactive rather than active-0.
+		if obs == nil {
+			if aa, ok := sig.(port.AbsenceAware); ok && !aa.AbsenceInformative() {
+				continue
+			}
+		}
 		// Extension-boundary policies (Signal is a public plug-in surface):
 		// (a) On Evaluate error, degrade — the signal contributes a Raw-0
 		//     Unattested score plus a SIGNAL_EVALUATION_FAILED risk code, and
