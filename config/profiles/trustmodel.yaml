@@ -21,7 +21,7 @@ signalWeights:
   certfingerprint.identity: 1.0
   dnsrecord.ans:            1.0
   dnsrecord.ans-badge:      1.0
-  # ── TrustModel Trust Index signals ──
-  trustscore.behavior:      1.0   # behavior
-  trustscore.safety:        1.0   # safety
-  trustscore.solvency:      1.0   # solvency
+  # ── TrustModel Trust Index signals (vendor.dimension.name) ──
+  trustmodel.behavior.score:  1.0   # behavior
+  trustmodel.safety.score:    1.0   # safety
+  trustmodel.solvency.score:  1.0   # solvency

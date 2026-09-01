@@ -6,6 +6,14 @@
 // These three signals fill exactly those dimensions from TrustModel's independent
 // evaluation, turning ANS's identity layer into a full trust layer.
 //
+// All three share ONE generic observation container (scoreValue): a 0..100
+// score plus provider-asserted risk codes and an optional explanation. Core
+// never re-derives tier or holds a per-dimension opinion — the provider (the
+// TrustModel hydrator) computes the score and the dimension-scoped risk codes
+// and hands them across the import boundary. That keeps the container reusable
+// by any provider (not just TrustModel) and keeps solvency from re-deriving the
+// cert tier that certtype already scores in the identity dimension.
+//
 // This package is meant to live inside the agent-trust-discovery module at
 // internal/scoring/signals/trustmodel/ (Go's internal/ visibility rule requires
 // it to be within the module) and be registered in internal/server.Build — see
@@ -17,176 +25,137 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/agentnameservice/agent-trust-discovery/internal/domain"
 	"github.com/agentnameservice/agent-trust-discovery/internal/port"
 )
 
+// DefaultLowThreshold is the score below which the generic
+// {DIMENSION}_TRUSTMODEL_SCORE_LOW backstop risk code is emitted. It is a
+// per-signal field (see New) so an operator can tune it in configuration
+// rather than it being a magic constant baked into Evaluate.
+const DefaultLowThreshold = 70
+
+// maxRiskCodes caps how many provider risk codes one observation may carry, so
+// a hostile or buggy hydrator can't balloon the evaluation payload.
+const maxRiskCodes = 16
+
+// riskCodeRe is the spec-§7.3 risk-code shape: uppercase, digits, underscores.
+var riskCodeRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
+
 // Signals returns the TrustModel Trust Index signals to register with the engine.
+//
+// IDs follow the vendor.dimension.name convention so the dimension segment
+// matches Dimension() and a vendor can carry multiple signals per dimension
+// later without an ID collision.
 func Signals() []port.Signal {
-	return []port.Signal{Behavior{}, Safety{}, Solvency{}}
+	return []port.Signal{
+		New("trustmodel.behavior.score", domain.DimensionBehavior, DefaultLowThreshold),
+		New("trustmodel.safety.score", domain.DimensionSafety, DefaultLowThreshold),
+		New("trustmodel.solvency.score", domain.DimensionSolvency, DefaultLowThreshold),
+	}
 }
 
-// scoreValue is the raw observation shape for the behavior and safety signals:
-// TrustModel's independent 0..100 score for that dimension.
+// scoreValue is the generic observation container shared by every TrustModel
+// signal. The provider computes Score and the dimension-scoped RiskCodes; core
+// just carries them. Passing a bare {"score": N} still works — you then get
+// only the threshold backstop, so nothing regresses for a minimal hydrator.
 type scoreValue struct {
-	Score int `json:"score"` // 0..100
+	Score       int      `json:"score"`                 // 0..100
+	RiskCodes   []string `json:"riskCodes,omitempty"`   // provider-asserted, {DIMENSION}_-prefixed
+	Explanation string   `json:"explanation,omitempty"` // optional; surfaced in the API response
 }
 
-func decodeScore(id string, value json.RawMessage) (scoreValue, error) {
+// ScoreSignal is a generic provider-score signal for a single dimension. One
+// instance per dimension; the ID, dimension, and low-score threshold are the
+// only things that differ. Because the container is generic, this same type
+// could back any provider's dimension score, not only TrustModel's.
+type ScoreSignal struct {
+	id        domain.SignalID
+	dimension domain.Dimension
+	threshold int
+}
+
+// New builds a ScoreSignal. threshold <= 0 falls back to DefaultLowThreshold.
+func New(id domain.SignalID, dim domain.Dimension, threshold int) ScoreSignal {
+	if threshold <= 0 {
+		threshold = DefaultLowThreshold
+	}
+	return ScoreSignal{id: id, dimension: dim, threshold: threshold}
+}
+
+func (s ScoreSignal) ID() domain.SignalID         { return s.id }
+func (s ScoreSignal) Dimension() domain.Dimension { return s.dimension }
+func (s ScoreSignal) Derived() bool               { return false }
+
+// prefix is the required {DIMENSION}_ prefix for this signal's risk codes, e.g.
+// "SOLVENCY_". Provider codes that don't carry it are dropped in Evaluate so a
+// signal can't leak a code into a dimension it doesn't own.
+func (s ScoreSignal) prefix() string {
+	return strings.ToUpper(string(s.dimension)) + "_"
+}
+
+// Validate enforces the container schema before the observation is persisted:
+// score in range, each risk code well-formed, and the count capped.
+func (s ScoreSignal) Validate(value json.RawMessage) error {
 	var v scoreValue
 	if err := json.Unmarshal(value, &v); err != nil {
-		return scoreValue{}, fmt.Errorf("%s: invalid value: %w", id, err)
+		return fmt.Errorf("%s: invalid value: %w", s.id, err)
 	}
 	if v.Score < 0 || v.Score > 100 {
-		return scoreValue{}, fmt.Errorf("%s: score must be in [0,100], got %d", id, v.Score)
+		return fmt.Errorf("%s: score must be in [0,100], got %d", s.id, v.Score)
 	}
-	return v, nil
+	if len(v.RiskCodes) > maxRiskCodes {
+		return fmt.Errorf("%s: too many riskCodes (%d > %d)", s.id, len(v.RiskCodes), maxRiskCodes)
+	}
+	for _, c := range v.RiskCodes {
+		if !riskCodeRe.MatchString(c) {
+			return fmt.Errorf("%s: risk code %q must match %s", s.id, c, riskCodeRe.String())
+		}
+	}
+	return nil
 }
 
-// ── Behavior ────────────────────────────────────────────────────────────────
-
-// Behavior scores how the agent actually behaves, from TrustModel's live
-// multi-dimension TrustScore. Fills the (empty in v1) behavior dimension.
-type Behavior struct{}
-
-func (Behavior) ID() domain.SignalID         { return "trustscore.behavior" }
-func (Behavior) Dimension() domain.Dimension { return domain.DimensionBehavior }
-func (Behavior) Derived() bool               { return false }
-
-func (Behavior) Validate(value json.RawMessage) error {
-	_, err := decodeScore("trustscore.behavior", value)
-	return err
-}
-
-func (Behavior) Evaluate(_ context.Context, _ domain.Agent, obs *domain.SignalObservation) (port.SignalResult, error) {
+// Evaluate maps the container onto a SignalResult: Raw is the score; RiskCodes
+// are the provider's dimension-scoped codes plus the normalized
+// {DIMENSION}_TRUSTMODEL_SCORE_LOW backstop when the score is below the
+// configured threshold. Codes whose prefix doesn't match this signal's
+// dimension are dropped.
+func (s ScoreSignal) Evaluate(_ context.Context, _ domain.Agent, obs *domain.SignalObservation) (port.SignalResult, error) {
+	prefix := s.prefix()
 	if obs == nil {
 		return port.SignalResult{
 			Raw:         0,
-			Explanation: "no TrustModel behavior score observed",
+			Explanation: fmt.Sprintf("no TrustModel %s score observed", s.dimension),
 			Attestation: domain.AttestationUnattested,
-			RiskCodes:   []string{"BEHAVIOR_TRUSTSCORE_UNKNOWN"},
+			RiskCodes:   []string{prefix + "TRUSTMODEL_UNKNOWN"},
 		}, nil
 	}
-	v, err := decodeScore("trustscore.behavior", obs.Value)
-	if err != nil {
-		return port.SignalResult{}, err
-	}
-	var risks []string
-	if v.Score < 70 {
-		risks = []string{"BEHAVIOR_TRUSTSCORE_LOW"}
-	}
-	return port.SignalResult{
-		Raw:         v.Score,
-		Explanation: fmt.Sprintf("TrustModel behavior score %d/100", v.Score),
-		Attestation: domain.AttestationUnattested,
-		RiskCodes:   risks,
-	}, nil
-}
-
-// ── Safety ──────────────────────────────────────────────────────────────────
-
-// Safety scores resistance to misuse (red-team + guardrail evidence) from
-// TrustModel. Fills the (empty in v1) safety dimension.
-type Safety struct{}
-
-func (Safety) ID() domain.SignalID         { return "trustscore.safety" }
-func (Safety) Dimension() domain.Dimension { return domain.DimensionSafety }
-func (Safety) Derived() bool               { return false }
-
-func (Safety) Validate(value json.RawMessage) error {
-	_, err := decodeScore("trustscore.safety", value)
-	return err
-}
-
-func (Safety) Evaluate(_ context.Context, _ domain.Agent, obs *domain.SignalObservation) (port.SignalResult, error) {
-	if obs == nil {
-		return port.SignalResult{
-			Raw:         0,
-			Explanation: "no TrustModel safety score observed",
-			Attestation: domain.AttestationUnattested,
-			RiskCodes:   []string{"SAFETY_TRUSTSCORE_UNKNOWN"},
-		}, nil
-	}
-	v, err := decodeScore("trustscore.safety", obs.Value)
-	if err != nil {
-		return port.SignalResult{}, err
-	}
-	var risks []string
-	if v.Score < 70 {
-		risks = []string{"SAFETY_TRUSTSCORE_LOW"}
-	}
-	return port.SignalResult{
-		Raw:         v.Score,
-		Explanation: fmt.Sprintf("TrustModel safety score %d/100", v.Score),
-		Attestation: domain.AttestationUnattested,
-		RiskCodes:   risks,
-	}, nil
-}
-
-// ── Solvency ────────────────────────────────────────────────────────────────
-
-// solvencyValue is the observation shape for the solvency signal: whether the
-// operating organization is identity-verified, and at what AgentCert level.
-type solvencyValue struct {
-	Verified bool   `json:"verified"`
-	Level    string `json:"level"` // DV | OV | EV
-}
-
-// Solvency scores whether a backed, accountable operator stands behind the
-// agent, from TrustModel's OV/EV organization & legal-entity verification.
-// Fills the (empty in v1) solvency dimension.
-type Solvency struct{}
-
-func (Solvency) ID() domain.SignalID         { return "trustscore.solvency" }
-func (Solvency) Dimension() domain.Dimension { return domain.DimensionSolvency }
-func (Solvency) Derived() bool               { return false }
-
-func (Solvency) Validate(value json.RawMessage) error {
-	var v solvencyValue
-	if err := json.Unmarshal(value, &v); err != nil {
-		return fmt.Errorf("trustscore.solvency: invalid value: %w", err)
-	}
-	switch v.Level {
-	case "DV", "OV", "EV":
-		return nil
-	default:
-		return fmt.Errorf("trustscore.solvency: level must be DV|OV|EV, got %q", v.Level)
-	}
-}
-
-func (Solvency) Evaluate(_ context.Context, _ domain.Agent, obs *domain.SignalObservation) (port.SignalResult, error) {
-	if obs == nil {
-		return port.SignalResult{
-			Raw:         0,
-			Explanation: "no TrustModel operator verification observed",
-			Attestation: domain.AttestationUnattested,
-			RiskCodes:   []string{"SOLVENCY_OPERATOR_UNKNOWN"},
-		}, nil
-	}
-	var v solvencyValue
+	var v scoreValue
 	if err := json.Unmarshal(obs.Value, &v); err != nil {
-		return port.SignalResult{}, err
+		return port.SignalResult{}, fmt.Errorf("%s: %w", s.id, err)
 	}
-	raw := 0
-	switch {
-	case !v.Verified:
-		raw = 0
-	case v.Level == "EV":
-		raw = 100
-	case v.Level == "OV":
-		raw = 75
-	case v.Level == "DV":
-		raw = 40
+
+	codes := make([]string, 0, len(v.RiskCodes)+1)
+	for _, c := range v.RiskCodes {
+		if strings.HasPrefix(c, prefix) {
+			codes = append(codes, c)
+		}
 	}
-	var risks []string
-	if !v.Verified {
-		risks = []string{"SOLVENCY_OPERATOR_UNVERIFIED"}
+	if v.Score < s.threshold {
+		codes = append(codes, prefix+"TRUSTMODEL_SCORE_LOW")
+	}
+
+	explanation := v.Explanation
+	if explanation == "" {
+		explanation = fmt.Sprintf("TrustModel %s score %d/100", s.dimension, v.Score)
 	}
 	return port.SignalResult{
-		Raw:         raw,
-		Explanation: fmt.Sprintf("operator verified=%t level=%s", v.Verified, v.Level),
+		Raw:         v.Score,
+		Explanation: explanation,
 		Attestation: domain.AttestationUnattested,
-		RiskCodes:   risks,
+		RiskCodes:   codes,
 	}, nil
 }
