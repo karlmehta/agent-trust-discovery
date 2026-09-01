@@ -41,6 +41,21 @@ func TestMetadataAndAbsence(t *testing.T) {
 	}
 }
 
+func TestSubject(t *testing.T) {
+	// New defaults the subject to agent.
+	if got := New("trustmodel.safety.score", domain.DimensionSafety, nil).Subject(); got != SubjectAgent {
+		t.Errorf("New subject = %q, want %q", got, SubjectAgent)
+	}
+	// NewWithSubject carries an explicit subject.
+	if got := NewWithSubject("agentgraph.safety.score", domain.DimensionSafety, "tool", nil).Subject(); got != "tool" {
+		t.Errorf("subject = %q, want tool", got)
+	}
+	// An empty subject falls back to agent.
+	if got := NewWithSubject("x.safety.score", domain.DimensionSafety, "", nil).Subject(); got != SubjectAgent {
+		t.Errorf("empty subject = %q, want %q", got, SubjectAgent)
+	}
+}
+
 func TestEvaluate(t *testing.T) {
 	s := New("trustmodel.safety.score", domain.DimensionSafety, nil)
 

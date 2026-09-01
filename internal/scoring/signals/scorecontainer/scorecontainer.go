@@ -56,6 +56,14 @@ const DefaultLowThreshold = 70
 // a hostile or buggy hydrator can't balloon the evaluation payload.
 const maxRiskCodes = 16
 
+// SubjectAgent is the default subject class: the observation scores the agent
+// itself. A provider that scores a *different* entity in the same dimension —
+// a tool / MCP server, or the controlling organization — declares its own
+// subject so a Trust Index never silently averages, e.g., a tool's safety into
+// an agent's safety. Subject is an open lowercase token (not a fixed enum) so a
+// new subject class needs no core change; the engine buckets by value.
+const SubjectAgent = "agent"
+
 // riskCodeRe is the risk-code shape (§7.3): uppercase, digits, underscores.
 var riskCodeRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
 
@@ -93,34 +101,50 @@ func decodeScore(raw json.RawMessage) (scoreValue, error) {
 }
 
 // ScoreSignal is a generic provider-score signal for one dimension. Construct
-// with New. It implements port.Signal and port.AbsenceAware.
+// with New (subject = agent) or NewWithSubject. It implements port.Signal and
+// port.AbsenceAware.
 type ScoreSignal struct {
 	id        domain.SignalID
 	dimension domain.Dimension
 	vendor    string
+	subject   string
 	threshold int
 }
 
-// New builds a ScoreSignal for a vendor.dimension.name id. The id's vendor
-// segment prefixes the generic backstop code (e.g. "trustmodel" ->
-// SAFETY_TRUSTMODEL_SCORE_LOW).
+// New builds a ScoreSignal that scores the agent (subject = SubjectAgent). See
+// NewWithSubject for the vendor/threshold semantics.
+func New(id domain.SignalID, dim domain.Dimension, threshold *int) ScoreSignal {
+	return NewWithSubject(id, dim, SubjectAgent, threshold)
+}
+
+// NewWithSubject builds a ScoreSignal for a vendor.dimension.name id that scores
+// the given subject class. The id's vendor segment prefixes the generic backstop
+// code (e.g. "trustmodel" -> SAFETY_TRUSTMODEL_SCORE_LOW).
+//
+// subject records what entity the score is about (SubjectAgent, "tool", "org",
+// …) so an index can keep, e.g., a tool-safety score in a different bucket from
+// an agent-safety score rather than averaging across subjects. An empty subject
+// defaults to SubjectAgent.
 //
 // threshold is a *int so 0 is a usable value: nil applies DefaultLowThreshold,
 // while an explicit 0 means "no low-score backstop" (a score can never be below
 // 0, so the {DIMENSION}_<VENDOR>_SCORE_LOW code is never emitted). Previously a
 // <= 0 threshold silently became 70, so an operator asking for "no backstop"
 // got the opposite.
-func New(id domain.SignalID, dim domain.Dimension, threshold *int) ScoreSignal {
+func NewWithSubject(id domain.SignalID, dim domain.Dimension, subject string, threshold *int) ScoreSignal {
 	t := DefaultLowThreshold
 	if threshold != nil {
 		t = *threshold
+	}
+	if subject == "" {
+		subject = SubjectAgent
 	}
 	// Normalise the vendor segment to the risk-code charset (^[A-Z0-9_]+$) so a
 	// hyphenated vendor like "acme-labs" yields SAFETY_ACME_LABS_SCORE_LOW, a
 	// valid code, rather than SAFETY_ACME-LABS_SCORE_LOW, which would fail the
 	// very shape check we enforce on provider-supplied codes.
 	vendor := sanitizeSegment(vendorSegment(string(id)))
-	return ScoreSignal{id: id, dimension: dim, vendor: vendor, threshold: t}
+	return ScoreSignal{id: id, dimension: dim, vendor: vendor, subject: subject, threshold: t}
 }
 
 // vendorSegment returns the first dot-segment of a vendor.dimension.name id,
@@ -152,6 +176,12 @@ func sanitizeSegment(s string) string {
 func (s ScoreSignal) ID() domain.SignalID         { return s.id }
 func (s ScoreSignal) Dimension() domain.Dimension { return s.dimension }
 func (s ScoreSignal) Derived() bool               { return false }
+
+// Subject reports the entity class this signal's score is about (SubjectAgent by
+// default). A Trust Index can group/filter by subject before aggregating, so a
+// tool-safety score and an agent-safety score in the same dimension are never
+// silently averaged together.
+func (s ScoreSignal) Subject() string { return s.subject }
 
 // AbsenceInformative reports false: a missing observation for a provider-fed
 // dimension means no provider has covered the agent yet, not that it scored
