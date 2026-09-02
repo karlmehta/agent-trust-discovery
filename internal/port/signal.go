@@ -46,6 +46,23 @@ type Signal interface {
 	Evaluate(ctx context.Context, agent domain.Agent, obs *domain.SignalObservation) (SignalResult, error)
 }
 
+// AbsenceAware is an OPTIONAL interface a Signal may implement to declare
+// whether a missing observation is informative. When a signal implements it and
+// returns false, the engine EXCLUDES that signal from the dimension roll-up for
+// an agent it has no observation for, instead of scoring it 0 (issue #13):
+// absence in a sparse, provider-fed dimension (solvency, behavior, safety)
+// carries no information about the agent — only that no provider has covered it
+// yet. Scoring it 0 at full weight penalizes the agent for a coverage gap and
+// makes adding any provider a global downgrade for every agent it hasn't seen.
+//
+// Signals that do NOT implement this interface, or return true, keep the v1
+// behavior: a missing observation scores 0 and counts toward the dimension.
+// That is correct for the zero-marginal-cost integrity built-ins, where a
+// missing observation (no DNSSEC record) is itself meaningful.
+type AbsenceAware interface {
+	AbsenceInformative() bool
+}
+
 // SignalRegistry holds the signals a binary knows about. The concrete
 // implementation lives with the scoring engine (design §4) to avoid an import
 // cycle; this port lets the import and search services depend on the abstraction.
