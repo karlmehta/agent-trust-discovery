@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -95,7 +96,7 @@ func decodeScore(raw json.RawMessage) (scoreValue, error) {
 		return scoreValue{}, err
 	}
 	if v.Score == nil {
-		return scoreValue{}, fmt.Errorf("score is required")
+		return scoreValue{}, errors.New("score is required")
 	}
 	return v, nil
 }
