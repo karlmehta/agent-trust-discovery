@@ -51,7 +51,8 @@ func Build(ctx context.Context, cfg config.Config, profileDefaultPath, profileDi
 	}
 	// TrustModel Trust Index signals fill the solvency/behavior/safety
 	// dimensions (empty in v1). Fed by the TrustModel hydrator via the import
-	// contract. See config/profiles/trustmodel.yaml.
+	// contract. Activating them is opt-in: copy config/examples/trustmodel-profile.yaml
+	// into config/profiles/ (or weight the ids in your own profile).
 	for _, s := range trustmodel.Signals() {
 		if err := reg.Register(s); err != nil {
 			return nil, nil, fmt.Errorf("server: register trustmodel signal: %w", err)

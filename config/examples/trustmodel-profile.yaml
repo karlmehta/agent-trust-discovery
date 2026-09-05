@@ -1,4 +1,9 @@
-# TrustModel Trust Index profile for agent-trust-discovery.
+# TrustModel Trust Index profile for agent-trust-discovery (OPT-IN EXAMPLE).
+#
+# This lives under config/examples/ so it is NOT auto-loaded — the repo does not
+# ship a vendor profile as always-on. To use it, copy this file into
+# config/profiles/ (every *.yaml there is loaded and selectable via ?profile=),
+# or copy its weights into your own profile.
 #
 # Extends the shipped default-profile.yaml by activating the three dimensions
 # ANS leaves empty in v1 (solvency, behavior, safety) and weighting the
